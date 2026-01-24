@@ -35,85 +35,16 @@ class GemmTuner:
         shutil.copy2(self.backup_path, self.config_path)
         
     def generate_config(self, act_parallel, row_block_size, col_block_size, parallel_size):
-        """Generate new configuration file"""
+        """Generate new configuration file with simplified format"""
         content = ""
         
-        # ACT_PARALLEL definition
+        # Simplified configuration format
         if act_parallel:
             content += "#define ACT_PARALLEL\n"
-        else:
-            content += "// #define ACT_PARALLEL\n"
         
-        # Detect architecture branches in original config file
-        with open(self.backup_path, 'r') as f:
-            original = f.read()
-        
-        has_avx = "__AVX__" in original or "__AVX2__" in original
-        has_arm = "__ARM_NEON" in original
-        
-        # If architecture detection exists, generate corresponding branches
-        if has_avx and has_arm:
-            # Multi-architecture configuration
-            content += "#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)\n"
-            content += "#if defined(ACT_PARALLEL)\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#else\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#endif\n"
-            content += "#elif defined(__ARM_NEON)\n"
-            content += "#if defined(ACT_PARALLEL)\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#else\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#endif\n"
-            content += "#endif\n"
-        elif has_avx:
-            # AVX architecture only
-            content += "#if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)\n"
-            content += "#if defined(ACT_PARALLEL)\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#else\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#endif\n"
-            content += "#endif\n"
-        elif has_arm:
-            # ARM architecture only
-            content += "#if defined(__ARM_NEON)\n"
-            content += "#if defined(ACT_PARALLEL)\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#else\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#endif\n"
-            content += "#endif\n"
-        else:
-            # No architecture detection, define directly
-            content += "#if defined(ACT_PARALLEL)\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#else\n"
-            content += f"    #define ROW_BLOCK_SIZE {row_block_size}\n"
-            content += f"    #define COL_BLOCK_SIZE {col_block_size}\n"
-            content += f"    #define PARALLEL_SIZE {parallel_size}\n"
-            content += "#endif\n"
-        
-        content += "\n"
+        content += f"#define ROW_BLOCK_SIZE {row_block_size}\n"
+        content += f"#define COL_BLOCK_SIZE {col_block_size}\n"
+        content += f"#define PARALLEL_SIZE {parallel_size}\n"
         
         with open(self.config_path, 'w') as f:
             f.write(content)
@@ -259,9 +190,12 @@ class GemmTuner:
             # Save results
             if output_csv is None:
                 timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-                csv_path = f"stats/tuning_results_{timestamp}.csv"
+                csv_path = f"../stats/tuning_results_{timestamp}.csv"
             else:
                 csv_path = output_csv
+            
+            # Ensure stats directory exists
+            os.makedirs(os.path.dirname(csv_path), exist_ok=True)
             self.save_results(csv_path)
             
             # Find best configuration
@@ -278,8 +212,18 @@ class GemmTuner:
                 print(f"PP128 Throughput: {best['pp_throughput']:.2f} ± {best['pp_std_dev']:.2f} t/s")
                 print(f"{'='*80}\n")
                 
+                # Show the configuration that will be written
+                print("Configuration to be written to gemm-config.h:")
+                print("-" * 80)
+                if best['act_parallel']:
+                    print("#define ACT_PARALLEL")
+                print(f"#define ROW_BLOCK_SIZE {best['row_block_size']}")
+                print(f"#define COL_BLOCK_SIZE {best['col_block_size']}")
+                print(f"#define PARALLEL_SIZE {best['parallel_size']}")
+                print("-" * 80)
+                
                 # Apply best configuration
-                apply = input("Do you want to apply this configuration? (y/n): ").strip().lower()
+                apply = input("\nDo you want to apply this configuration to gemm-config.h? (y/n): ").strip().lower()
                 if apply == 'y':
                     self.generate_config(
                         best['act_parallel'],
@@ -288,17 +232,30 @@ class GemmTuner:
                         best['parallel_size']
                     )
                     self.rebuild_project()
-                    print("✅ Best configuration applied!")
+                    print("✅ Best configuration applied and project rebuilt!")
                 else:
                     self.restore_config()
                     print("✅ Original configuration restored")
+                
+                # Clean up backup file
+                if self.backup_path.exists():
+                    self.backup_path.unlink()
+                    print(f"🗑️  Removed backup file: {self.backup_path}")
             
         except KeyboardInterrupt:
             print("\n⚠️  Tuning interrupted by user")
             self.restore_config()
+            # Clean up backup file
+            if self.backup_path.exists():
+                self.backup_path.unlink()
+                print(f"🗑️  Removed backup file: {self.backup_path}")
         except Exception as e:
             print(f"\n❌ Error during tuning: {e}")
             self.restore_config()
+            # Clean up backup file
+            if self.backup_path.exists():
+                self.backup_path.unlink()
+                print(f"🗑️  Removed backup file: {self.backup_path}")
             raise
 
 
@@ -308,9 +265,9 @@ def generate_configurations():
     
     act_parallel_options = [True]
     
-    row_sizes = [2, 4, 8, 16, 32]
-    col_sizes = [32, 64, 128, 256, 512, 1024]
-    parallelism_degree = [2, 4, 8]
+    row_sizes = [2, 4, 8]#[2, 4, 8, 16, 32]
+    col_sizes = [32, 64]#[32, 64, 128, 256, 512, 1024]
+    parallelism_degree = [4]
     
     for act_parallel in act_parallel_options:
         for row in row_sizes:

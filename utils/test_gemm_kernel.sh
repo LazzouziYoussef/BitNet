@@ -1,3 +1,110 @@
+#!/bin/bash
+# Unified GEMM kernel benchmark script
+# Builds, tests, and benchmarks the GEMM kernel with configurable output
+
+set -e
+
+# Default values
+BUILD_DIR="../build"
+ITERATIONS=1000
+OUTPUT_CSV=""
+SKIP_BUILD=false
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Print usage
+print_usage() {
+    cat << EOF
+Usage: $0 [options]
+
+Options:
+  -o, --output <path>     Output CSV file path (default: ../stats/gemm_kernel_test_noparal.csv)
+  -i, --iterations <num>  Number of iterations per test (default: 1000)
+  -s, --skip-build        Skip building the benchmark binary
+  -h, --help              Show this help message
+
+Examples:
+  # Run with default settings
+  $0
+
+  # Specify custom output file
+  $0 -o /path/to/my_results.csv
+
+  # Quick test with fewer iterations
+  $0 -i 100 -o quick_test.csv
+
+  # Skip build if already compiled
+  $0 -s -o results.csv
+EOF
+}
+
+# Parse command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -o|--output)
+            OUTPUT_CSV="$2"
+            shift 2
+            ;;
+        -i|--iterations)
+            ITERATIONS="$2"
+            shift 2
+            ;;
+        -s|--skip-build)
+            SKIP_BUILD=true
+            shift
+            ;;
+        -h|--help)
+            print_usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1"
+            print_usage
+            exit 1
+            ;;
+    esac
+done
+
+# Set default output CSV if not specified
+if [ -z "$OUTPUT_CSV" ]; then
+    OUTPUT_CSV="${SCRIPT_DIR}/../stats/gemm_kernel_test_noparal.csv"
+fi
+
+# Create output directory first
+mkdir -p "$(dirname "$OUTPUT_CSV")"
+
+# Convert to absolute path
+if [[ "$OUTPUT_CSV" = /* ]]; then
+    # Already absolute path
+    OUTPUT_CSV="$OUTPUT_CSV"
+else
+    # Convert relative path to absolute
+    OUTPUT_CSV="$(cd "$(dirname "$OUTPUT_CSV")" && pwd)/$(basename "$OUTPUT_CSV")"
+fi
+
+echo "=========================================="
+echo "GEMM Kernel Benchmark Suite"
+echo "=========================================="
+echo "Configuration:"
+echo "  Iterations: $ITERATIONS"
+echo "  Output CSV: $OUTPUT_CSV"
+echo "  Skip build: $SKIP_BUILD"
+echo "=========================================="
+echo ""
+
+# Build the benchmark binary
+if [ "$SKIP_BUILD" = false ]; then
+    echo "Step 1: Building GEMM kernel benchmark..."
+    echo "------------------------------------------"
+    
+    CXX=${CXX:-g++}
+    
+    # Create build directory if it doesn't exist
+    mkdir -p "${SCRIPT_DIR}/${BUILD_DIR}"
+    
+    # Create temporary C++ source file
+    TEMP_CPP="${SCRIPT_DIR}/${BUILD_DIR}/test_gemm_kernel_temp.cpp"
+    
+    cat > "${TEMP_CPP}" << 'EOF'
 /**
  * Standalone benchmark for ggml_gemm_i2_i8_s kernel
  * 
@@ -131,13 +238,20 @@ void run_benchmark(const BenchmarkConfig& config) {
     printf("Allocating matrices...\n");
     
     // X matrix (i2 format): nc x n, but stored as nc x (n/4) bytes
-    uint8_t* X = (uint8_t*)malloc(config.nc * config.n / 4);
+    // Align to 64 bytes for AVX-512, which is backward compatible with AVX2 (32 bytes)
+    size_t x_size = config.nc * config.n / 4;
+    size_t x_size_aligned = ((x_size + 63) / 64) * 64;
+    uint8_t* X = (uint8_t*)aligned_alloc(64, x_size_aligned);
     
     // Y matrix (i8 format): nr x n
-    int8_t* Y = (int8_t*)malloc(config.nr * config.n);
+    size_t y_size = config.nr * config.n;
+    size_t y_size_aligned = ((y_size + 63) / 64) * 64;
+    int8_t* Y = (int8_t*)aligned_alloc(64, y_size_aligned);
     
     // Result matrix (float32): nr x nc
-    float* S = (float*)malloc(config.nr * config.nc * sizeof(float));
+    size_t s_size = config.nr * config.nc * sizeof(float);
+    size_t s_size_aligned = ((s_size + 63) / 64) * 64;
+    float* S = (float*)aligned_alloc(64, s_size_aligned);
     
     if (!X || !Y || !S) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -272,3 +386,188 @@ int main(int argc, char** argv) {
     
     return 0;
 }
+EOF
+    
+    # Compiler flags
+    CXXFLAGS="-O3 -march=native -mtune=native -std=c++17 -fopenmp"
+    CXXFLAGS+=" -I${SCRIPT_DIR}/.. -I${SCRIPT_DIR}/../include"
+    CXXFLAGS+=" -I${SCRIPT_DIR}/../3rdparty/llama.cpp/ggml/include"
+    CXXFLAGS+=" -I${SCRIPT_DIR}/../3rdparty/llama.cpp/ggml/src"
+    CXXFLAGS+=" -I${SCRIPT_DIR}/../3rdparty/llama.cpp/include"
+    CXXFLAGS+=" -DNDEBUG -ffast-math"
+    
+    # Link flags
+    LDFLAGS="-lm -lpthread"
+    
+    # Link with pre-built libraries
+    GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
+    GGML_SO="${GGML_LIB_DIR}/libggml.so"
+    
+    if [ ! -f "${GGML_SO}" ]; then
+        echo "❌ Error: Cannot find libggml.so at ${GGML_SO}"
+        echo "Please build the project first with: cmake --build build"
+        rm -f "${TEMP_CPP}"
+        exit 1
+    fi
+    
+    LDFLAGS+=" -L${GGML_LIB_DIR} -lggml -Wl,-rpath,${GGML_LIB_DIR}"
+    
+    # Output binary
+    BENCHMARK_BIN="${SCRIPT_DIR}/${BUILD_DIR}/test_gemm_kernel"
+    
+    echo "Compiler: ${CXX}"
+    echo "Building from embedded source..."
+    echo ""
+    
+    # Build
+    ${CXX} ${CXXFLAGS} "${TEMP_CPP}" -o ${BENCHMARK_BIN} ${LDFLAGS}
+    
+    if [ $? -eq 0 ]; then
+        echo "✅ Build successful!"
+        rm -f "${TEMP_CPP}"
+        echo ""
+    else
+        echo "❌ Build failed!"
+        rm -f "${TEMP_CPP}"
+        exit 1
+    fi
+else
+    echo "Step 1: Skipping build (using existing binary)"
+    echo "------------------------------------------"
+    BENCHMARK_BIN="${SCRIPT_DIR}/${BUILD_DIR}/test_gemm_kernel"
+    
+    if [ ! -f "${BENCHMARK_BIN}" ]; then
+        echo "❌ Error: Benchmark binary not found at ${BENCHMARK_BIN}"
+        echo "Please run without -s to build it first."
+        exit 1
+    fi
+    echo "✅ Found existing binary"
+    echo ""
+fi
+
+# Set LD_LIBRARY_PATH to include the GGML library directory
+GGML_LIB_DIR="${SCRIPT_DIR}/../build/3rdparty/llama.cpp/ggml/src"
+export LD_LIBRARY_PATH="${GGML_LIB_DIR}:${LD_LIBRARY_PATH}"
+
+echo "Step 2: Running benchmark tests"
+echo "------------------------------------------"
+echo "Library path: ${GGML_LIB_DIR}"
+echo ""
+
+# Write CSV header
+echo "test_name,n,nr,nc,time_ms,gflops,throughput_tokens_per_sec" > "$OUTPUT_CSV"
+echo "Results will be saved to: $OUTPUT_CSV"
+echo ""
+
+# Function to extract metrics and append to CSV
+extract_and_save() {
+    local test_name="$1"
+    local output="$2"
+    
+    # Extract values using grep and awk
+    local n=$(echo "$output" | grep "Embedding dimension" | awk '{print $5}')
+    local nr=$(echo "$output" | grep "Matrix Y rows" | awk '{print $6}')
+    local nc=$(echo "$output" | grep "Matrix X columns" | awk '{print $6}')
+    local avg_time=$(echo "$output" | grep "Average time" | awk '{print $4}')
+    local min_time=$(echo "$output" | grep "Min time" | awk '{print $4}')
+    local max_time=$(echo "$output" | grep "Max time" | awk '{print $4}')
+    local gflops=$(echo "$output" | grep "GFLOPS" | awk '{print $3}')
+    local throughput=$(echo "$output" | grep "Throughput" | awk '{print $3}')
+    
+    # Check if values were extracted successfully
+    if [ -z "$avg_time" ] || [ -z "$min_time" ] || [ -z "$max_time" ]; then
+        echo "Warning: Failed to extract timing data for ${test_name}"
+        echo "${test_name},${n},${nr},${nc},N/A,N/A,N/A" >> "$OUTPUT_CSV"
+        return
+    fi
+    
+    # Calculate standard deviation estimate from range
+    # Using awk with proper variable passing
+    local std_time=$(awk -v min="$min_time" -v max="$max_time" 'BEGIN {printf "%.4f", (max - min) / 4}')
+    
+    # Format as mean±std
+    local time_formatted="${avg_time}±${std_time}"
+    
+    # Append to CSV
+    echo "${test_name},${n},${nr},${nc},${time_formatted},${gflops},${throughput}" >> "$OUTPUT_CSV"
+}
+
+# Run benchmark tests
+echo "=========================================="
+echo "BitNet-2B Typical Shapes Performance Test"
+echo "=========================================="
+echo ""
+
+echo "Test 1: Single Token Generation (Attention QKV projection)"
+echo "  Scenario: Generating 1 token at a time"
+echo "  Shape: n=2048, r=1, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 1 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "single_token_gen" "$OUTPUT"
+echo ""
+
+echo "Test 2: Small Batch Prompt Processing (Attention QKV projection)"
+echo "  Scenario: Processing prompt with 128 tokens, batch size 1"
+echo "  Shape: n=2048, r=128, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 128 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "small_batch_prompt" "$OUTPUT"
+echo ""
+
+echo "Test 3: Medium Batch Prompt Processing (Attention QKV projection)"
+echo "  Scenario: Processing prompt with 256 tokens or batch of 256"
+echo "  Shape: n=2048, r=256, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 256 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "medium_batch_prompt" "$OUTPUT"
+echo ""
+
+echo "Test 4: Large Batch Processing (Attention QKV projection)"
+echo "  Scenario: Processing 512 tokens or batch of 512"
+echo "  Shape: n=2048, r=512, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 512 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "large_batch_prompt" "$OUTPUT"
+echo ""
+
+echo "Test 5: FFN Up-projection (Small batch)"
+echo "  Scenario: Feed-forward network expansion, 128 tokens"
+echo "  Shape: n=2048, r=128, c=8192"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 128 -c 8192 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "ffn_up_projection" "$OUTPUT"
+echo ""
+
+echo "Test 6: FFN Down-projection (Small batch)"
+echo "  Scenario: Feed-forward network reduction, 128 tokens"
+echo "  Shape: n=8192, r=128, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 8192 -r 128 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "ffn_down_projection" "$OUTPUT"
+echo ""
+
+echo "Test 7: Long Context Processing"
+echo "  Scenario: Processing very long context (2048 tokens)"
+echo "  Shape: n=2048, r=2048, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 2048 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "long_context" "$OUTPUT"
+echo ""
+
+echo "Test 8: Batched Token Generation"
+echo "  Scenario: Generating tokens for 32 sequences simultaneously"
+echo "  Shape: n=2048, r=32, c=2048"
+OUTPUT=$($BENCHMARK_BIN -n 2048 -r 32 -c 2048 -i $ITERATIONS 2>&1)
+echo "$OUTPUT"
+extract_and_save "batched_token_gen" "$OUTPUT"
+echo ""
+
+echo "=========================================="
+echo "All tests completed successfully!"
+echo "=========================================="
+echo "Results saved to: $OUTPUT_CSV"
+echo ""
+echo "Summary:"
+wc -l "$OUTPUT_CSV" | awk '{print "  Total records:", $1 - 1}'
+echo "  Output file: $OUTPUT_CSV"
+echo "=========================================="
