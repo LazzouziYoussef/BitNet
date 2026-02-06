@@ -814,7 +814,7 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
             const uint8_t *px = x + i * 1024;
             const int8_t  *py = y_col + i * 4096;
             __m256i accu32[PARALLEL_SIZE];
-
+            
             for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
                 accu32[iy] = _mm256_setzero_si256();
             }
